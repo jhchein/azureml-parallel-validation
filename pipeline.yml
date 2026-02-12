@@ -1,0 +1,103 @@
+# ------------------------------------------------------------------
+# pipeline.yml — AzureML pipeline with a parallel validation job.
+#
+# Submits a parallel job that reads a tabular MLTable (dispatch table)
+# and fans out validation work across compute nodes.
+#
+# Usage:
+#   az ml job create --file pipeline/pipeline.yml \
+#       --resource-group <your-resource-group> \
+#       --workspace-name <your-workspace-name>
+#
+# Prerequisites:
+#   - AzureML workspace with datastores registered for each blob store
+#   - AmlCompute cluster (referenced below as <your-compute-cluster>)
+#   - Managed identity on the cluster with Storage Blob Data Reader
+#     on each storage account
+# ------------------------------------------------------------------
+
+$schema: https://azuremlschemas.azureedge.net/latest/pipelineJob.schema.json
+type: pipeline
+
+display_name: parallel-validation-pipeline
+description: >
+  Runs a custom Docker-based validation framework in parallel across
+  thousands of blob-stored sequences. Each row in the dispatch table
+  (MLTable) is one validation unit with three data-source URIs.
+
+settings:
+  # Replace with your compute cluster name.
+  default_compute: azureml:<your-compute-cluster>
+
+jobs:
+  validate:
+    type: parallel
+
+    # -- Input: the tabular dispatch table ----------------------------
+    inputs:
+      dispatch_table:
+        type: mltable
+        path: ./data
+        # "direct" is required for tabular mltable — the parallel job
+        # splits the *table* by physical size, not by file count.
+        mode: direct
+
+    # -- Output: aggregated validation results ------------------------
+    outputs:
+      results:
+        type: uri_file
+        mode: rw_mount
+
+    # -- Parallel job configuration -----------------------------------
+
+    # Reference to the input that will be split into mini-batches.
+    input_data: ${{inputs.dispatch_table}}
+
+    # Physical size per mini-batch. Each CSV row is ~200-300 bytes,
+    # so "1kb" targets roughly 1-3 rows (= 1-3 sequences) per batch.
+    # ⚙ Tune this: increase for fast validations, decrease for slow ones.
+    mini_batch_size: "1kb"
+
+    # Number of compute nodes to spread work across.
+    # ⚙ Tune this: more nodes = faster throughput, higher cost.
+    resources:
+      instance_count: 2 # <-- adjust to your cluster size
+
+    # Workers per node. Set to 1 unless entry_script.py is thread-safe
+    # and your validation framework supports concurrent invocations.
+    # ⚙ Tune this: >1 only if your framework and data I/O are safe to parallelize within a node.
+    max_concurrency_per_instance: 1
+
+    logging_level: "INFO"
+
+    # Number of allowed mini-batch failures before the job fails.
+    # ⚙ Tune this: -1 = ignore all failures (useful during development).
+    #    Set to 0 for strict mode in production.
+    mini_batch_error_threshold: -1
+
+    retry_settings:
+      max_retries: 2
+      timeout: 600 # seconds per mini-batch — increase for slow validations
+
+    # -- Task definition ----------------------------------------------
+    task:
+      type: run_function
+      code: ./src
+      entry_script: entry_script.py
+      # The environment is built from the Dockerfile in ./environment/.
+      # AzureML builds and caches the image in the workspace ACR.
+      # For production, switch to a pre-built image reference:
+      #   environment:
+      #     image: <your-acr>.azurecr.io/validation-env:latest
+      environment:
+        build:
+          path: ./environment
+      program_arguments: >-
+        --error_threshold -1
+        --allowed_failed_percent 100
+        --task_overhead_timeout 120
+        --progress_update_timeout 600
+        --first_task_creation_timeout 600
+        --copy_logs_to_parent True
+        --resource_monitor_interval 60
+      append_row_to: ${{outputs.results}}

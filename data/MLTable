@@ -1,0 +1,16 @@
+# Dispatch table: each row is one validation unit with three blob URIs.
+# The parallel job splits this table by physical size (mini_batch_size)
+# and passes each mini-batch as a pandas DataFrame to the entry script.
+#
+# Replace sample_dispatch.csv with your own CSV listing the actual
+# azureml://datastores/<name>/paths/<path> URIs for your data.
+
+type: mltable
+
+paths:
+  - file: ./sample_dispatch.csv
+
+transformations:
+  - read_delimited:
+      delimiter: ","
+      header: all_files_same_headers
