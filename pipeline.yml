@@ -13,7 +13,7 @@
 #   - AzureML workspace with datastores registered for each blob store
 #   - AmlCompute cluster (referenced below as <your-compute-cluster>)
 #   - Managed identity on the cluster with Storage Blob Data Reader
-#     on each storage account
+#     on each storage account used by the mounted inputs
 # ------------------------------------------------------------------
 
 $schema: https://azuremlschemas.azureedge.net/latest/pipelineJob.schema.json
@@ -23,7 +23,8 @@ display_name: parallel-validation-pipeline
 description: >
   Runs a custom Docker-based validation framework in parallel across
   thousands of blob-stored sequences. Each row in the dispatch table
-  (MLTable) is one validation unit with three data-source URIs.
+  (MLTable) is one validation unit with relative file paths resolved
+  against read-only mounted input stores.
 
 settings:
   # Replace with your compute cluster name.
@@ -41,6 +42,23 @@ jobs:
         # "direct" is required for tabular mltable — the parallel job
         # splits the *table* by physical size, not by file count.
         mode: direct
+
+      # Read-only FUSE mounts used by the entry script.
+      # Replace datastore names with your actual workspace datastores.
+      sequences_store:
+        type: uri_folder
+        path: azureml://datastores/<sequences-datastore>/paths/
+        mode: ro_mount
+
+      labels_store:
+        type: uri_folder
+        path: azureml://datastores/<labels-datastore>/paths/
+        mode: ro_mount
+
+      mlhc_data:
+        type: uri_folder
+        path: azureml://datastores/<mlhc-datastore>/paths/
+        mode: ro_mount
 
     # -- Output: aggregated validation results ------------------------
     outputs:
@@ -86,13 +104,19 @@ jobs:
       entry_script: entry_script.py
       # The environment is built from the Dockerfile in ./environment/.
       # AzureML builds and caches the image in the workspace ACR.
-      # For production, switch to a pre-built image reference:
+      # To avoid anonymous-environment hash collisions, prefer a pre-registered
+      # named/versioned environment and reference it directly:
+      #   environment: azureml:<your-environment-name>:<version>
+      # For production, you can also reference a pre-built image:
       #   environment:
       #     image: <your-acr>.azurecr.io/validation-env:latest
       environment:
         build:
           path: ./environment
       program_arguments: >-
+        --sequences_mount ${{inputs.sequences_store}}
+        --labels_mount ${{inputs.labels_store}}
+        --mlhc_mount ${{inputs.mlhc_data}}
         --error_threshold -1
         --allowed_failed_percent 100
         --task_overhead_timeout 120

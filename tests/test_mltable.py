@@ -12,7 +12,7 @@ def dispatch_df() -> pd.DataFrame:
     return tbl.to_pandas_dataframe()
 
 
-EXPECTED_COLUMNS = ["sequence_path", "label_path", "third_data_path"]
+EXPECTED_COLUMNS = ["sequence_filepath", "label_filepath", "mlhc_filepath"]
 
 
 class TestMLTableSchema:

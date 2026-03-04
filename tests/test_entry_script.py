@@ -1,49 +1,42 @@
 """Tests for the parallel job entry script (run function)."""
 
+import os
 import subprocess
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-# The entry script lives outside the tests package, so we import by path.
-# Adjust if your sys.path configuration differs.
-from entry_script import run, init, shutdown, _parse_long_uri, _fs_cache
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+import entry_script
+from entry_script import init, run, shutdown
 
 
 @pytest.fixture(autouse=True)
-def _clear_fs_cache() -> None:
-    """Prevent stale AzureMachineLearningFileSystem mocks leaking between tests."""
-    _fs_cache.clear()
-
-
-SAMPLE_URI_PREFIX = (
-    "azureml://subscriptions/00000000-0000-0000-0000-000000000000"
-    "/resourcegroups/rg/workspaces/ws/datastores"
-)
+def _reset_mounts() -> None:
+    entry_script._SEQUENCES_MOUNT = None
+    entry_script._LABELS_MOUNT = None
+    entry_script._MLHC_MOUNT = None
+    yield
+    entry_script._SEQUENCES_MOUNT = None
+    entry_script._LABELS_MOUNT = None
+    entry_script._MLHC_MOUNT = None
 
 
 @pytest.fixture()
 def mini_batch() -> pd.DataFrame:
-    """A two-row mini-batch DataFrame with long-form URIs."""
     return pd.DataFrame(
         {
-            "sequence_path": [
-                f"{SAMPLE_URI_PREFIX}/recordings/paths/seq_001/recording.bin",
-                f"{SAMPLE_URI_PREFIX}/recordings/paths/seq_002/recording.bin",
+            "sequence_filepath": [
+                "sequence_001/recording_folder",
+                "sequence_002/recording_folder",
             ],
-            "label_path": [
-                f"{SAMPLE_URI_PREFIX}/labels/paths/seq_001/labels.csv",
-                f"{SAMPLE_URI_PREFIX}/labels/paths/seq_002/labels.csv",
+            "label_filepath": [
+                "labels/sequence_001/labels.json",
+                "labels/sequence_002/labels.json",
             ],
-            "third_data_path": [
-                f"{SAMPLE_URI_PREFIX}/thirddata/paths/seq_001/metadata.dat",
-                f"{SAMPLE_URI_PREFIX}/thirddata/paths/seq_002/metadata.dat",
+            "mlhc_filepath": [
+                "sequences_mlhc_data/sequence_001.parquet",
+                "sequences_mlhc_data/sequence_002.parquet",
             ],
         }
     )
@@ -59,26 +52,43 @@ def _make_completed_process(
     )
 
 
-EXPECTED_OUTPUT_COLUMNS = ["sequence_path", "status", "exit_code", "message"]
+EXPECTED_OUTPUT_COLUMNS = ["sequence_filepath", "status", "exit_code", "message"]
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+class TestInit:
+    @patch("entry_script._build_parser")
+    def test_init_sets_mount_paths(self, mock_build_parser: MagicMock) -> None:
+        parser = MagicMock()
+        parser.parse_known_args.return_value = (
+            MagicMock(
+                sequences_mount="/mnt/sequences",
+                labels_mount="/mnt/labels",
+                mlhc_mount="/mnt/mlhc",
+            ),
+            [],
+        )
+        mock_build_parser.return_value = parser
+
+        init()
+
+        assert entry_script._SEQUENCES_MOUNT == "/mnt/sequences"
+        assert entry_script._LABELS_MOUNT == "/mnt/labels"
+        assert entry_script._MLHC_MOUNT == "/mnt/mlhc"
 
 
 class TestRunSuccess:
-    """Validation subprocess returns exit code 0."""
+    @pytest.fixture(autouse=True)
+    def _set_mounts(self) -> None:
+        entry_script._SEQUENCES_MOUNT = "/mnt/sequences"
+        entry_script._LABELS_MOUNT = "/mnt/labels"
+        entry_script._MLHC_MOUNT = "/mnt/mlhc"
 
     @patch("entry_script.subprocess.run")
-    @patch("entry_script.AzureMachineLearningFileSystem")
     def test_returns_correct_columns(
         self,
-        mock_fs_cls: MagicMock,
         mock_subprocess: MagicMock,
         mini_batch: pd.DataFrame,
     ) -> None:
-        mock_fs_cls.return_value.download = MagicMock()
         mock_subprocess.return_value = _make_completed_process()
 
         result = run(mini_batch)
@@ -86,14 +96,11 @@ class TestRunSuccess:
         assert list(result.columns) == EXPECTED_OUTPUT_COLUMNS
 
     @patch("entry_script.subprocess.run")
-    @patch("entry_script.AzureMachineLearningFileSystem")
     def test_row_count_matches_input(
         self,
-        mock_fs_cls: MagicMock,
         mock_subprocess: MagicMock,
         mini_batch: pd.DataFrame,
     ) -> None:
-        mock_fs_cls.return_value.download = MagicMock()
         mock_subprocess.return_value = _make_completed_process()
 
         result = run(mini_batch)
@@ -101,14 +108,11 @@ class TestRunSuccess:
         assert len(result) == len(mini_batch)
 
     @patch("entry_script.subprocess.run")
-    @patch("entry_script.AzureMachineLearningFileSystem")
     def test_pass_status_on_success(
         self,
-        mock_fs_cls: MagicMock,
         mock_subprocess: MagicMock,
         mini_batch: pd.DataFrame,
     ) -> None:
-        mock_fs_cls.return_value.download = MagicMock()
         mock_subprocess.return_value = _make_completed_process(stdout="all good")
 
         result = run(mini_batch)
@@ -117,19 +121,41 @@ class TestRunSuccess:
         assert all(result["exit_code"] == 0)
         assert all(result["message"] == "all good")
 
-
-class TestRunFailure:
-    """Validation subprocess returns non-zero exit code."""
-
     @patch("entry_script.subprocess.run")
-    @patch("entry_script.AzureMachineLearningFileSystem")
-    def test_fail_status_on_nonzero_exit(
+    def test_subprocess_receives_resolved_mount_paths(
         self,
-        mock_fs_cls: MagicMock,
         mock_subprocess: MagicMock,
         mini_batch: pd.DataFrame,
     ) -> None:
-        mock_fs_cls.return_value.download = MagicMock()
+        mock_subprocess.return_value = _make_completed_process()
+
+        run(mini_batch)
+
+        first_call = mock_subprocess.call_args_list[0][0][0]
+        assert first_call[1].endswith(
+            os.path.join("sequences", "sequence_001", "recording_folder")
+        )
+        assert first_call[2].endswith(
+            os.path.join("labels", "labels", "sequence_001", "labels.json")
+        )
+        assert first_call[3].endswith(
+            os.path.join("mlhc", "sequences_mlhc_data", "sequence_001.parquet")
+        )
+
+
+class TestRunFailure:
+    @pytest.fixture(autouse=True)
+    def _set_mounts(self) -> None:
+        entry_script._SEQUENCES_MOUNT = "/mnt/sequences"
+        entry_script._LABELS_MOUNT = "/mnt/labels"
+        entry_script._MLHC_MOUNT = "/mnt/mlhc"
+
+    @patch("entry_script.subprocess.run")
+    def test_fail_status_on_nonzero_exit(
+        self,
+        mock_subprocess: MagicMock,
+        mini_batch: pd.DataFrame,
+    ) -> None:
         mock_subprocess.return_value = _make_completed_process(
             returncode=1, stderr="validation error"
         )
@@ -142,94 +168,66 @@ class TestRunFailure:
 
 
 class TestRunException:
-    """Download or subprocess raises an exception."""
-
-    @patch("entry_script.AzureMachineLearningFileSystem")
-    def test_exception_produces_fail_row(
+    @patch("entry_script.subprocess.run")
+    def test_missing_mounts_produce_fail_rows(
         self,
-        mock_fs_cls: MagicMock,
+        mock_subprocess: MagicMock,
         mini_batch: pd.DataFrame,
     ) -> None:
-        mock_fs_cls.return_value.download = MagicMock(
-            side_effect=ConnectionError("blob unreachable")
-        )
+        mock_subprocess.return_value = _make_completed_process()
 
         result = run(mini_batch)
 
         assert len(result) == len(mini_batch)
         assert all(result["status"] == "fail")
         assert all(result["exit_code"] == -1)
-        assert all("blob unreachable" in m for m in result["message"])
+        assert all("not initialised" in m for m in result["message"])
 
 
-class TestInitShutdown:
-    """init() and shutdown() execute without error."""
+class TestPathTraversalDefense:
+    @pytest.fixture(autouse=True)
+    def _set_mounts(self) -> None:
+        entry_script._SEQUENCES_MOUNT = "/mnt/sequences"
+        entry_script._LABELS_MOUNT = "/mnt/labels"
+        entry_script._MLHC_MOUNT = "/mnt/mlhc"
 
-    def test_init_runs(self) -> None:
-        init()
+    @patch("entry_script.subprocess.run")
+    def test_relative_path_escape_is_blocked(
+        self,
+        mock_subprocess: MagicMock,
+    ) -> None:
+        mock_subprocess.return_value = _make_completed_process()
 
-    def test_shutdown_clears_cache(self) -> None:
-        shutdown()
-
-
-# ---------------------------------------------------------------------------
-# URI parsing
-# ---------------------------------------------------------------------------
-
-
-class TestParseLongUri:
-    """Unit tests for _parse_long_uri."""
-
-    def test_valid_uri_splits_correctly(self) -> None:
-        uri = (
-            "azureml://subscriptions/00000000-0000-0000-0000-000000000000"
-            "/resourcegroups/rg/workspaces/ws"
-            "/datastores/recordings/paths/seq_001/recording.bin"
+        mini_batch = pd.DataFrame(
+            {
+                "sequence_filepath": ["../../escape/sequence_folder"],
+                "label_filepath": ["labels/sequence_001/labels.json"],
+                "mlhc_filepath": ["sequences_mlhc_data/sequence_001.parquet"],
+            }
         )
-        fs_uri, file_path = _parse_long_uri(uri)
 
-        assert fs_uri == (
-            "azureml://subscriptions/00000000-0000-0000-0000-000000000000"
-            "/resourcegroups/rg/workspaces/ws"
-            "/datastores/recordings"
-        )
-        assert file_path == "seq_001/recording.bin"
+        result = run(mini_batch)
 
-    def test_nested_path(self) -> None:
-        uri = (
-            "azureml://subscriptions/sub/resourcegroups/rg"
-            "/workspaces/ws/datastores/ds/paths/a/b/c/file.csv"
-        )
-        fs_uri, file_path = _parse_long_uri(uri)
-
-        assert fs_uri.endswith("/datastores/ds")
-        assert file_path == "a/b/c/file.csv"
-
-    def test_missing_paths_segment_raises(self) -> None:
-        bad_uri = (
-            "azureml://subscriptions/sub/resourcegroups/rg/workspaces/ws/datastores/ds"
-        )
-        with pytest.raises(ValueError, match="/paths/"):
-            _parse_long_uri(bad_uri)
-
-
-# ---------------------------------------------------------------------------
-# Timeout handling
-# ---------------------------------------------------------------------------
+        assert len(result) == 1
+        assert result.loc[0, "status"] == "fail"
+        assert result.loc[0, "exit_code"] == -1
+        assert "escapes mount root" in result.loc[0, "message"]
+        mock_subprocess.assert_not_called()
 
 
 class TestRunTimeout:
-    """subprocess.TimeoutExpired produces a fail row."""
+    @pytest.fixture(autouse=True)
+    def _set_mounts(self) -> None:
+        entry_script._SEQUENCES_MOUNT = "/mnt/sequences"
+        entry_script._LABELS_MOUNT = "/mnt/labels"
+        entry_script._MLHC_MOUNT = "/mnt/mlhc"
 
     @patch("entry_script.subprocess.run")
-    @patch("entry_script.AzureMachineLearningFileSystem")
     def test_timeout_produces_fail_row(
         self,
-        mock_fs_cls: MagicMock,
         mock_subprocess: MagicMock,
         mini_batch: pd.DataFrame,
     ) -> None:
-        mock_fs_cls.return_value.download = MagicMock()
         mock_subprocess.side_effect = subprocess.TimeoutExpired(
             cmd="validate.sh", timeout=600
         )
@@ -240,3 +238,8 @@ class TestRunTimeout:
         assert all(result["status"] == "fail")
         assert all(result["exit_code"] == -1)
         assert all("timed out" in m.lower() for m in result["message"])
+
+
+class TestShutdown:
+    def test_shutdown_runs(self) -> None:
+        shutdown()

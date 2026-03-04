@@ -39,11 +39,27 @@ class TestValidateJob:
     def test_dispatch_table_mode_is_direct(self, job: dict) -> None:
         assert job["inputs"]["dispatch_table"]["mode"] == "direct"
 
+    def test_mounted_inputs_are_uri_folders(self, job: dict) -> None:
+        assert job["inputs"]["sequences_store"]["type"] == "uri_folder"
+        assert job["inputs"]["labels_store"]["type"] == "uri_folder"
+        assert job["inputs"]["mlhc_data"]["type"] == "uri_folder"
+
+    def test_mounted_inputs_use_ro_mount(self, job: dict) -> None:
+        assert job["inputs"]["sequences_store"]["mode"] == "ro_mount"
+        assert job["inputs"]["labels_store"]["mode"] == "ro_mount"
+        assert job["inputs"]["mlhc_data"]["mode"] == "ro_mount"
+
     def test_has_append_row_to(self, job: dict) -> None:
         assert "append_row_to" in job["task"]
 
     def test_entry_script_is_entry_script_py(self, job: dict) -> None:
         assert job["task"]["entry_script"] == "entry_script.py"
+
+    def test_program_arguments_include_mount_flags(self, job: dict) -> None:
+        arguments = job["task"]["program_arguments"]
+        assert "--sequences_mount" in arguments
+        assert "--labels_mount" in arguments
+        assert "--mlhc_mount" in arguments
 
     def test_mini_batch_size_is_string(self, job: dict) -> None:
         assert isinstance(job["mini_batch_size"], str)

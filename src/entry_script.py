@@ -2,135 +2,102 @@
 entry_script.py — AzureML parallel job entry script.
 
 Receives mini-batches (pandas DataFrames) from the tabular MLTable
-dispatch table. Each row contains three long-form azureml:// URIs
-pointing to data in separate blob stores.
+dispatch table. Each row contains relative paths that are resolved
+against read-only mounted input stores.
 
 For each row the script:
-  1. Downloads the three files via azureml-fsspec.
+  1. Resolves local filesystem paths from mount roots + relative paths.
   2. Invokes the validation framework (validate.sh) via subprocess.
   3. Returns a result DataFrame row with pass/fail status.
-
-Alternative: replace azureml-fsspec with the azure-storage-blob SDK
-if you need lower-level control over blob access.
 """
 
+import argparse
 import logging
 import os
+from pathlib import Path
 import subprocess
-import tempfile
 from typing import Any
 
 import pandas as pd
-from azureml.fsspec import AzureMachineLearningFileSystem
 
 logger = logging.getLogger(__name__)
 
-# --- Module-level state ----------------------------------------------
-
-_fs_cache: dict[str, AzureMachineLearningFileSystem] = {}
-
-# Path to the validation framework inside the Docker image.
-# Replace with the actual binary / script path in your image.
 _VALIDATE_CMD = "/opt/validation/validate.sh"
-
-# Timeout (seconds) for the validation subprocess per sequence.
 _SUBPROCESS_TIMEOUT = 600
 
-
-# --- Helpers ---------------------------------------------------------
-
-
-def _parse_long_uri(long_uri: str) -> tuple[str, str]:
-    """Split a long-form azureml:// URI into (fs_uri, file_path).
-
-    Long form:
-        azureml://subscriptions/.../datastores/<ds>/paths/<path>
-
-    Returns:
-        fs_uri    – everything up to and including the datastore name
-        file_path – the portion after ``/paths/``
-    """
-    marker = "/paths/"
-    idx = long_uri.find(marker)
-    if idx == -1:
-        raise ValueError(f"URI missing '/paths/' segment: {long_uri}")
-    fs_uri = long_uri[:idx]
-    file_path = long_uri[idx + len(marker) :]
-    return fs_uri, file_path
+_SEQUENCES_MOUNT: str | None = None
+_LABELS_MOUNT: str | None = None
+_MLHC_MOUNT: str | None = None
 
 
-def _get_fs(fs_uri: str) -> AzureMachineLearningFileSystem:
-    """Return a cached AzureMachineLearningFileSystem for *fs_uri*.
-
-    Authentication is handled automatically — azureml-fsspec uses the
-    compute cluster's managed identity (no keys or tokens needed).
-    """
-    if fs_uri not in _fs_cache:
-        _fs_cache[fs_uri] = AzureMachineLearningFileSystem(fs_uri)
-    return _fs_cache[fs_uri]
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--sequences_mount", required=True)
+    parser.add_argument("--labels_mount", required=True)
+    parser.add_argument("--mlhc_mount", required=True)
+    return parser
 
 
-def _download_file(long_uri: str, dest_dir: str) -> str:
-    """Download a blob via azureml-fsspec and return the local path."""
-    fs_uri, remote_path = _parse_long_uri(long_uri)
-    fs = _get_fs(fs_uri)
-
-    local_name = os.path.basename(remote_path)
-    local_path = os.path.join(dest_dir, local_name)
-
-    logger.info("Downloading %s → %s", long_uri, local_path)
-    fs.download(remote_path, local_path)
-    return local_path
+def _require_mounts() -> tuple[str, str, str]:
+    if not _SEQUENCES_MOUNT or not _LABELS_MOUNT or not _MLHC_MOUNT:
+        raise RuntimeError(
+            "Mount paths are not initialised. Ensure init() parsed "
+            "--sequences_mount, --labels_mount, and --mlhc_mount."
+        )
+    return _SEQUENCES_MOUNT, _LABELS_MOUNT, _MLHC_MOUNT
 
 
-# --- Parallel job interface ------------------------------------------
+def _resolve_safe_path(mount_root: str, relative_path: str) -> str:
+    mount_root_resolved = Path(mount_root).resolve(strict=False)
+    candidate = (mount_root_resolved / relative_path).resolve(strict=False)
+
+    if os.path.commonpath([str(candidate), str(mount_root_resolved)]) != str(
+        mount_root_resolved
+    ):
+        raise ValueError(
+            f"Relative path escapes mount root: {relative_path}"
+        )
+
+    return str(candidate)
+
+
+def _resolve_paths(row: pd.Series) -> tuple[str, str, str]:
+    sequences_mount, labels_mount, mlhc_mount = _require_mounts()
+    sequence_path = _resolve_safe_path(sequences_mount, row["sequence_filepath"])
+    label_path = _resolve_safe_path(labels_mount, row["label_filepath"])
+    mlhc_path = _resolve_safe_path(mlhc_mount, row["mlhc_filepath"])
+    return sequence_path, label_path, mlhc_path
 
 
 def init() -> None:
-    """Called once per worker process. Minimal setup."""
-    logger.info("Worker initialised.")
+    global _SEQUENCES_MOUNT, _LABELS_MOUNT, _MLHC_MOUNT
+
+    parser = _build_parser()
+    args, _ = parser.parse_known_args()
+    _SEQUENCES_MOUNT = args.sequences_mount
+    _LABELS_MOUNT = args.labels_mount
+    _MLHC_MOUNT = args.mlhc_mount
+
+    logger.info("Worker initialised with mounted inputs.")
 
 
 def run(mini_batch: pd.DataFrame) -> pd.DataFrame:
-    """Process one mini-batch (one or more rows from the dispatch table).
-
-    Args:
-        mini_batch: DataFrame with columns ``sequence_path``,
-            ``label_path``, ``third_data_path`` — each a long-form
-            ``azureml://`` URI string.
-
-    Returns:
-        DataFrame with one row per input row. Columns:
-            sequence_path, status, exit_code, message
-    """
     results: list[dict[str, Any]] = []
 
     for _, row in mini_batch.iterrows():
-        seq_uri: str = row["sequence_path"]
-        label_uri: str = row["label_path"]
-        third_uri: str = row["third_data_path"]
+        sequence_relative_path: str = row["sequence_filepath"]
 
-        logger.info("Processing sequence: %s", seq_uri)
+        logger.info("Processing sequence folder: %s", sequence_relative_path)
 
         try:
-            # Download the three files to a temporary directory.
-            # AzureML parallel jobs don't provide a per-batch scratch dir,
-            # so we use tempfile for auto-cleanup and collision avoidance.
-            with tempfile.TemporaryDirectory() as tmp:
-                seq_path = _download_file(seq_uri, tmp)
-                label_path = _download_file(label_uri, tmp)
-                third_path = _download_file(third_uri, tmp)
+            sequence_path, label_path, mlhc_path = _resolve_paths(row)
 
-                # Run the validation framework via subprocess.
-                # We shell out (rather than calling Python directly) because
-                # the framework is a CLI tool (e.g. Julia binary, shell script)
-                # that lives in the Docker image.
-                proc = subprocess.run(
-                    [_VALIDATE_CMD, seq_path, label_path, third_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=_SUBPROCESS_TIMEOUT,
-                )
+            proc = subprocess.run(
+                [_VALIDATE_CMD, sequence_path, label_path, mlhc_path],
+                capture_output=True,
+                text=True,
+                timeout=_SUBPROCESS_TIMEOUT,
+            )
 
             status = "pass" if proc.returncode == 0 else "fail"
             message = (
@@ -139,7 +106,7 @@ def run(mini_batch: pd.DataFrame) -> pd.DataFrame:
 
             results.append(
                 {
-                    "sequence_path": seq_uri,
+                    "sequence_filepath": sequence_relative_path,
                     "status": status,
                     "exit_code": proc.returncode,
                     "message": message,
@@ -147,10 +114,10 @@ def run(mini_batch: pd.DataFrame) -> pd.DataFrame:
             )
 
         except Exception as exc:
-            logger.error("Failed to process %s: %s", seq_uri, exc)
+            logger.error("Failed to process %s: %s", sequence_relative_path, exc)
             results.append(
                 {
-                    "sequence_path": seq_uri,
+                    "sequence_filepath": sequence_relative_path,
                     "status": "fail",
                     "exit_code": -1,
                     "message": str(exc),
@@ -161,6 +128,4 @@ def run(mini_batch: pd.DataFrame) -> pd.DataFrame:
 
 
 def shutdown() -> None:
-    """Called once when the worker is done. Clean up cached FS clients."""
-    _fs_cache.clear()
     logger.info("Worker shutdown complete.")
