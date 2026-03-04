@@ -26,12 +26,13 @@ Docker-in-Docker doesn't work on AzureML. And you can't point a single MLTable a
                     │                                         │
   ┌──────────┐      │  ┌────────────────────────────────────┐ │
   │ dispatch │────▶│  │ Parallel Job (N nodes × M workers) │ │
-  │ table    │      │  │                                    │ │
-  │ (CSV →   │      │  │  Custom Docker Environment         │ │
-  │  MLTable)│      │  │  ┌───────────────────────────────┐ │ │
-  └──────────┘      │  │  │ entry_script.py               │ │ │
+  │ table    │      │  │  (FUSE mounts 3 blob datastores)   │ │
+  │ (CSV →   │      │  │                                    │ │
+  │  MLTable)│      │  │  Custom Docker Environment         │ │
+  └──────────┘      │  │  ┌───────────────────────────────┐ │ │
+                    │  │  │ entry_script.py               │ │ │
                     │  │  │  1. read DataFrame row        │ │ │
-                    │  │  │  2. download 3 blobs (fsspec) │ │ │
+                    │  │  │  2. resolve FUSE mount paths  │ │ │
                     │  │  │  3. subprocess → validate.sh  │ │ │
                     │  │  │  4. return result row         │ │ │
                     │  │  └───────────────────────────────┘ │ │
@@ -75,13 +76,13 @@ pipeline/
 
 ### `sample_dispatch.csv`
 
-Each row is one validation unit. Columns are long-form `azureml://` URIs that include the full subscription/resource-group/workspace path:
+Each row is one validation unit. Columns represent the specific path segments to target relative to the respective FUSE-mounted inputs:
 
 | Column            | Points to              |
 | ----------------- | ---------------------- |
-| `sequence_path`   | Recording blob         |
-| `label_path`      | Labels blob            |
-| `third_data_path` | Third data source blob |
+| `sequence_filepath`   | Relative path to recording sequence folder |
+| `label_filepath`      | Relative path to labels file |
+| `mlhc_filepath` | Relative path to MLHC parquet file |
 
 ### `MLTable`
 
@@ -95,11 +96,9 @@ Installs Julia, Python dependencies (from `requirements.txt`), and copies `valid
 
 The parallel job entry point. Key functions:
 
-- **`init()`** - called once per worker. Minimal setup (logging).
-- **`run(mini_batch)`** - for each row: downloads three files via `azureml-fsspec` → runs `validate.sh` via subprocess → returns a result DataFrame.
-- **`shutdown()`** - cleans up cached filesystem clients.
-
-The CSV stores long-form URIs (`azureml://subscriptions/.../datastores/<ds>/paths/...`), which `AzureMachineLearningFileSystem` accepts directly - no URI expansion needed.
+- **`init()`** - called once per worker. Instantiates argparse to consume FUSE mount paths and runs minimal setup (logging).
+- **`run(mini_batch)`** - for each row: creates secure paths by resolving user relative-paths against the mounted volumes → runs `validate.sh` via subprocess → returns a result DataFrame.
+- **`shutdown()`** - empty cleanup hook.
 
 ### `pipeline.yml`
 
@@ -170,8 +169,8 @@ Tests mock all Azure and subprocess calls - no workspace, credentials, or networ
 | What to change           | Where                                                | Notes                                                                                      |
 | ------------------------ | ---------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | Your test framework      | `environment/Dockerfile` + `environment/validate.sh` | Replace Julia/validate.sh with your actual framework binary or script                      |
-| Input data columns       | `data/sample_dispatch.csv`                           | Add/remove/rename columns to match your data sources. Update `entry_script.py` accordingly |
-| Data access method       | `src/entry_script.py`                                | Uses `azureml-fsspec`; switch to `azure-storage-blob` SDK if you need lower-level control  |
+| Input data columns       | `data/sample_dispatch.csv` + `pipeline.yml`          | Modify columns to target the new layout. Add inputs mapping to `argparse` worker args      |
+| Data access method       | `pipeline.yml`                                       | Add `uri_folder` mounts allowing Python native `os.path` operations                        |
 | Parallelism              | `pipeline.yml`                                       | Tune `resources.instance_count`, `max_concurrency_per_instance`, `mini_batch_size`         |
 | Output format            | `src/entry_script.py`                                | The `run()` return DataFrame shape feeds into `append_row_to`                              |
 | Environment provisioning | `pipeline.yml`                                       | For production, pre-build the image and switch from `build.path` to `image:`               |
@@ -182,11 +181,11 @@ Tests mock all Azure and subprocess calls - no workspace, credentials, or networ
 
 ### Why a Dispatch Table?
 
-When data lives across multiple blob stores (different storage accounts, different containers), you can't point a single MLTable at a folder and split by file count. Instead, we use a CSV where each row lists the URIs for one validation unit. The parallel job splits the _table_ by row, and the entry script handles data access per row.
+When data lives across multiple blob stores (different storage accounts, different containers), you can't point a single MLTable at a folder and split by file count. Instead, we use a CSV where each row lists the relative URIs for one validation unit. The parallel job splits the _table_ by row, and the entry script handles data access per row.
 
-### Data Access Pattern
+### Data Access Pattern - FUSE mounts
 
-The entry script uses `azureml-fsspec` - an AzureML-native fsspec implementation that handles credential passthrough automatically via the compute's managed identity. The CSV stores long-form URIs (`azureml://subscriptions/.../datastores/<name>/paths/<path>`), which the `AzureMachineLearningFileSystem` constructor accepts directly.
+The script accesses data via FUSE. `pipeline.yml` defines `type: uri_folder` with `mode: ro_mount`. AzureML transparently handles the managed identity credentials and mount orchestration. The datastores act as standard Linux mounts, enabling any underlying program (Docker scripts, Julia, or standard Python `open()`) to efficiently process paths and directories organically rather than bulk-downloading files up-front via `azureml-fsspec`.
 
 ---
 
