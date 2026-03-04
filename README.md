@@ -78,11 +78,11 @@ pipeline/
 
 Each row is one validation unit. Columns represent the specific path segments to target relative to the respective FUSE-mounted inputs:
 
-| Column            | Points to              |
-| ----------------- | ---------------------- |
-| `sequence_filepath`   | Relative path to recording sequence folder |
-| `label_filepath`      | Relative path to labels file |
-| `mlhc_filepath` | Relative path to MLHC parquet file |
+| Column              | Points to                                  |
+| ------------------- | ------------------------------------------ |
+| `sequence_filepath` | Relative path to recording sequence folder |
+| `label_filepath`    | Relative path to labels file               |
+| `mlhc_filepath`     | Relative path to MLHC parquet file         |
 
 ### `MLTable`
 
@@ -166,14 +166,14 @@ Tests mock all Azure and subprocess calls - no workspace, credentials, or networ
 
 ## How to Adapt This
 
-| What to change           | Where                                                | Notes                                                                                      |
-| ------------------------ | ---------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Your test framework      | `environment/Dockerfile` + `environment/validate.sh` | Replace Julia/validate.sh with your actual framework binary or script                      |
-| Input data columns       | `data/sample_dispatch.csv` + `pipeline.yml`          | Modify columns to target the new layout. Add inputs mapping to `argparse` worker args      |
-| Data access method       | `pipeline.yml`                                       | Add `uri_folder` mounts allowing Python native `os.path` operations                        |
-| Parallelism              | `pipeline.yml`                                       | Tune `resources.instance_count`, `max_concurrency_per_instance`, `mini_batch_size`         |
-| Output format            | `src/entry_script.py`                                | The `run()` return DataFrame shape feeds into `append_row_to`                              |
-| Environment provisioning | `pipeline.yml`                                       | For production, pre-build the image and switch from `build.path` to `image:`               |
+| What to change           | Where                                                | Notes                                                                                 |
+| ------------------------ | ---------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Your test framework      | `environment/Dockerfile` + `environment/validate.sh` | Replace Julia/validate.sh with your actual framework binary or script                 |
+| Input data columns       | `data/sample_dispatch.csv` + `pipeline.yml`          | Modify columns to target the new layout. Add inputs mapping to `argparse` worker args |
+| Data access method       | `pipeline.yml`                                       | Add `uri_folder` mounts allowing Python native `os.path` operations                   |
+| Parallelism              | `pipeline.yml`                                       | Tune `resources.instance_count`, `max_concurrency_per_instance`, `mini_batch_size`    |
+| Output format            | `src/entry_script.py`                                | The `run()` return DataFrame shape feeds into `append_row_to`                         |
+| Environment provisioning | `pipeline.yml`                                       | For production, pre-build the image and switch from `build.path` to `image:`          |
 
 ---
 

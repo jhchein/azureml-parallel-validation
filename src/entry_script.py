@@ -54,9 +54,7 @@ def _resolve_safe_path(mount_root: str, relative_path: str) -> str:
     if os.path.commonpath([str(candidate), str(mount_root_resolved)]) != str(
         mount_root_resolved
     ):
-        raise ValueError(
-            f"Relative path escapes mount root: {relative_path}"
-        )
+        raise ValueError(f"Relative path escapes mount root: {relative_path}")
 
     return str(candidate)
 
